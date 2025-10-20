@@ -48,13 +48,16 @@ cargo, gh, ripgrep, fd, bat
 Add to your `~/.config/starship.toml`:
 
 ```toml
-[custom.nix_packages]
+[custom.nix_path_pkgs]
 command = "nix-path-pkgs"
 when = "nix-path-pkgs"
 format = "via [$symbol($output)]($style) "
 symbol = "❄️ "
 style = "bold blue"
+ignore_timeout = true   # Optional
 ```
+
+A cold cache run will likely exceed the default starship `command_timeout` of 500ms.
 
 ### Configuration
 
