@@ -2,6 +2,15 @@
 name = "nix-path-pkgs"
 version = "0.1.0"
 edition = "2024"
+description = "Ultra-fast CLI for displaying Nix packages in Starship prompts"
+repository = "https://github.com/usertam/nix-path-pkgs"
+license = "MIT"
+keywords = ["nix", "starship", "prompt", "cli"]
+categories = ["command-line-utilities"]
 
-[dependencies]
-serde_json = "1"
+[profile.release]
+lto = true              # Link-time optimization
+codegen-units = 1       # Better optimization (slower compile)
+opt-level = 3           # Maximum optimization
+strip = true            # Strip symbols for smaller binary
+panic = "abort"         # Smaller binary, faster panic

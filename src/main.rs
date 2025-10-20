@@ -5,12 +5,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin"];
 const NIX_EXPR: &str = r#"
 with builtins.getFlake "nixpkgs";
 with legacyPackages.${builtins.currentSystem};
 lib.filter lib.isDerivation stdenv.allowedRequisites
 "#;
+
+const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin"];
 
 fn main() -> ExitCode {
     // cache TTL (secs). TTL=0 => no cache (no read, no write).
@@ -19,24 +20,35 @@ fn main() -> ExitCode {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3600);
 
+    // Get cache metadata once (avoid redundant nix calls)
+    let cache_key = if ttl > 0 {
+        get_cache_key()
+    } else {
+        None
+    };
+
     // nix eval output (cached unless TTL=0)
     let bytes = if ttl == 0 {
-        refresh(false)
+        refresh(false, None)
     } else {
-        read_cache(ttl).ok().flatten().unwrap_or_else(|| refresh(true))
+        read_cache(ttl, cache_key.as_deref())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| refresh(true, cache_key.as_deref()))
     };
     let ignore = parse_hashes(&bytes);
 
     // Walk $PATH in order; keep first occurrence only.
-    let mut ordered: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut ordered: Vec<&str> = Vec::with_capacity(32);
+    let mut seen: HashSet<&str> = HashSet::with_capacity(32);
 
-    for dir in env::var("PATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+    let path = env::var("PATH").unwrap_or_default();
+    for dir in path.split(':').filter(|s| !s.is_empty()) {
         if let Some((h, name)) = hash_and_name(dir) {
-            if ignore.contains(h) || SKIP.contains(&name.as_str()) || name.is_empty() {
+            if ignore.contains(h) || SKIP.contains(&name) || name.is_empty() {
                 continue;
             }
-            if seen.insert(name.clone()) {
+            if seen.insert(name) {
                 ordered.push(name);
             }
         }
@@ -50,7 +62,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn refresh(write_cache_after: bool) -> Vec<u8> {
+fn get_cache_key() -> Option<String> {
+    // Get revision-system key in one nix call (no JSON parsing needed)
+    let output = Command::new("nix")
+        .args([
+            "eval",
+            "--impure",
+            "--raw",
+            "--expr",
+            r#""${(builtins.getFlake "nixpkgs").rev}-${builtins.currentSystem}""#,
+        ])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        None
+    }
+}
+
+fn refresh(write_cache_after: bool, cache_key: Option<&str>) -> Vec<u8> {
     let o = Command::new("nix")
         .args(["eval", "--impure", "--json", "--expr", NIX_EXPR])
         .output()
@@ -59,31 +91,50 @@ fn refresh(write_cache_after: bool) -> Vec<u8> {
         panic!("nix eval failed:\n{}", String::from_utf8_lossy(&o.stderr));
     }
     if write_cache_after {
-        let _ = write_cache(&o.stdout); // best-effort
+        let _ = write_cache(&o.stdout, cache_key); // best-effort
     }
     o.stdout
 }
 
 fn parse_hashes(json: &[u8]) -> HashSet<String> {
-    let Ok(items) = serde_json::from_slice::<Vec<String>>(json) else {
+    let Ok(text) = std::str::from_utf8(json) else {
         return HashSet::new();
     };
-    items
-        .into_iter()
-        .filter_map(|s| store_hash(&s).map(|h| h.to_owned()))
-        .collect()
-}
 
-// "/nix/store/<hash>-..." => "<hash>"
-fn store_hash(p: &str) -> Option<&str> {
-    if !p.starts_with("/nix/store/") || p.len() < 44 || p.as_bytes().get(43) != Some(&b'-') {
-        return None;
+    // Fast path: extract hashes directly from JSON array
+    // Format: ["/nix/store/<hash>-...", ...]
+    // Pre-allocate with estimated capacity
+    let mut hashes = HashSet::with_capacity(64);
+    let mut i = 0;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        // Look for "/nix/store/" pattern
+        if bytes.get(i..i + 11) == Some(b"/nix/store/") {
+            let hash_start = i + 11;
+            let hash_end = hash_start + 32;
+
+            // Validate hash position and dash separator
+            if hash_end < bytes.len()
+                && bytes.get(hash_end) == Some(&b'-')
+                && text.is_char_boundary(hash_start)
+                && text.is_char_boundary(hash_end)
+            {
+                hashes.insert(text[hash_start..hash_end].to_string());
+                i = hash_end;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
     }
-    p.get(11..43)
+
+    hashes
 }
 
 // "/nix/store/<hash>-bash-5.3/bin" => ("<hash>", "bash")
-fn hash_and_name(dir: &str) -> Option<(&str, String)> {
+fn hash_and_name(dir: &str) -> Option<(&str, &str)> {
     if !dir.starts_with("/nix/store/") || dir.len() < 44 || dir.as_bytes().get(43) != Some(&b'-') {
         return None;
     }
@@ -98,7 +149,7 @@ fn hash_and_name(dir: &str) -> Option<(&str, String)> {
             break;
         }
     }
-    Some((hash, item[..cut].to_string()))
+    Some((hash, &item[..cut]))
 }
 
 // XDG cache helpers
@@ -110,25 +161,76 @@ fn cache_dir() -> PathBuf {
     }
     Path::new(&env::var("HOME").unwrap_or_else(|_| ".".into())).join(".cache/nix-path-pkgs")
 }
-fn cache_file() -> PathBuf {
-    cache_dir().join("stdenv-allowed-requisites.json")
+
+fn cache_file(cache_key: &str) -> PathBuf {
+    cache_dir().join(format!("{}-stdenv-allowed-requisites.json", cache_key))
 }
-fn read_cache(ttl_secs: u64) -> io::Result<Option<Vec<u8>>> {
-    let p = cache_file();
-    let m = match fs::metadata(&p) {
+
+// Clean up old cache files (older than 1 day)
+fn cleanup_old_cache() -> io::Result<()> {
+    let dir = cache_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let now = SystemTime::now();
+    let one_day = Duration::from_secs(86400);
+
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        if let Ok(metadata) = fs::metadata(&path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    if age > one_day {
+                        let _ = fs::remove_file(&path); // best-effort
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+fn read_cache(ttl_secs: u64, cache_key: Option<&str>) -> io::Result<Option<Vec<u8>>> {
+    let Some(key) = cache_key else {
+        return Ok(None);
+    };
+    let p = cache_file(key);
+
+    let meta = match fs::metadata(&p) {
         Ok(m) => m,
         Err(_) => return Ok(None),
     };
-    if m.modified()
+
+    if meta
+        .modified()
         .ok()
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .is_some_and(|d| d <= Duration::from_secs(ttl_secs))
     {
-        return fs::read(&p).map(Some);
+        return Ok(Some(fs::read(&p)?));
     }
+
     Ok(None)
 }
-fn write_cache(bytes: &[u8]) -> io::Result<()> {
+
+fn write_cache(bytes: &[u8], cache_key: Option<&str>) -> io::Result<()> {
+    let Some(key) = cache_key else {
+        return Ok(());
+    };
+    let p = cache_file(key);
+
     fs::create_dir_all(cache_dir())?;
-    fs::write(cache_file(), bytes)
+    fs::write(&p, bytes)?;
+
+    // Clean up old cache files
+    let _ = cleanup_old_cache(); // best-effort
+
+    Ok(())
 }
