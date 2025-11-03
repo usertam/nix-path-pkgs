@@ -8,6 +8,7 @@ mod main_module;
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use crate::main_module;
 
     // We need to expose internal functions for testing
     // For now, we'll test what we can through the module
@@ -323,5 +324,59 @@ lib.filter lib.isDerivation stdenv.allowedRequisites
         assert_eq!(output, "bash, git, cargo");
         assert!(output.contains(", "));
         assert_eq!(output.matches(", ").count(), 2);
+    }
+
+    #[test]
+    fn test_command_timeout() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Create a command that will hang for 5 seconds (longer than our 2s timeout)
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+
+        let start = Instant::now();
+        let result = main_module::run_with_timeout(cmd, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+
+        // Should return None due to timeout
+        assert!(result.is_none(), "Command should timeout and return None");
+
+        // Should take approximately 2 seconds (allow some margin)
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+            "Timeout should occur around 2 seconds, but took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_command_timeout_success() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Create a command that completes quickly (under timeout)
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+
+        let start = Instant::now();
+        let result = main_module::run_with_timeout(cmd, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+
+        // Should complete successfully
+        assert!(result.is_some(), "Command should complete and return Some");
+        let output = result.unwrap();
+        assert!(output.status.success(), "Command should succeed");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello"
+        );
+
+        // Should complete well under the timeout
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Fast command should complete quickly, took {:?}",
+            elapsed
+        );
     }
 }

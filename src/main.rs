@@ -1,7 +1,9 @@
 use std::{
     collections::HashSet, env, fs, io,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Output},
+    sync::mpsc,
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -12,6 +14,21 @@ lib.filter lib.isDerivation stdenv.allowedRequisites
 "#;
 
 const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin"];
+
+// Run a command with a timeout. Returns None if timeout occurs.
+pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = cmd.output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Some(output),
+        _ => None, // Timeout or command failed
+    }
+}
 
 fn main() -> ExitCode {
     // cache TTL (secs). TTL=0 => no cache (no read, no write).
@@ -64,16 +81,16 @@ fn main() -> ExitCode {
 
 fn get_cache_key() -> Option<String> {
     // Get revision-system key in one nix call (no JSON parsing needed)
-    let output = Command::new("nix")
-        .args([
-            "eval",
-            "--impure",
-            "--raw",
-            "--expr",
-            r#""${(builtins.getFlake "nixpkgs").rev}-${builtins.currentSystem}""#,
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("nix");
+    cmd.args([
+        "eval",
+        "--impure",
+        "--raw",
+        "--expr",
+        r#""${(builtins.getFlake "nixpkgs").rev}-${builtins.currentSystem}""#,
+    ]);
+
+    let output = run_with_timeout(cmd, Duration::from_secs(2))?;
 
     if output.status.success() {
         String::from_utf8(output.stdout).ok()
@@ -83,13 +100,23 @@ fn get_cache_key() -> Option<String> {
 }
 
 fn refresh(write_cache_after: bool, cache_key: Option<&str>) -> Vec<u8> {
-    let o = Command::new("nix")
-        .args(["eval", "--impure", "--json", "--expr", NIX_EXPR])
-        .output()
-        .expect("failed to exec `nix`");
+    let mut cmd = Command::new("nix");
+    cmd.args(["eval", "--impure", "--json", "--expr", NIX_EXPR]);
+
+    // Use timeout to prevent hanging
+    let o = match run_with_timeout(cmd, Duration::from_secs(2)) {
+        Some(output) => output,
+        None => {
+            // Timeout occurred, return empty result (will result in exit code 1)
+            return Vec::new();
+        }
+    };
+
     if !o.status.success() {
-        panic!("nix eval failed:\n{}", String::from_utf8_lossy(&o.stderr));
+        // Command failed, return empty result instead of panicking
+        return Vec::new();
     }
+
     if write_cache_after {
         let _ = write_cache(&o.stdout, cache_key); // best-effort
     }
