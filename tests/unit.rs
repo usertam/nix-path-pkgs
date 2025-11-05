@@ -336,7 +336,7 @@ lib.filter lib.isDerivation stdenv.allowedRequisites
         cmd.arg("5");
 
         let start = Instant::now();
-        let result = main_module::run_with_timeout(cmd, Duration::from_secs(2));
+        let result = main_module::nix::run_command(cmd, Some(Duration::from_secs(2)));
         let elapsed = start.elapsed();
 
         // Should return None due to timeout
@@ -360,7 +360,7 @@ lib.filter lib.isDerivation stdenv.allowedRequisites
         cmd.arg("hello");
 
         let start = Instant::now();
-        let result = main_module::run_with_timeout(cmd, Duration::from_secs(2));
+        let result = main_module::nix::run_command(cmd, Some(Duration::from_secs(2)));
         let elapsed = start.elapsed();
 
         // Should complete successfully

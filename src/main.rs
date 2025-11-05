@@ -1,34 +1,9 @@
-use std::{
-    collections::HashSet, env, fs, io,
-    path::{Path, PathBuf},
-    process::{Command, ExitCode, Output},
-    sync::mpsc,
-    thread,
-    time::{Duration, SystemTime},
-};
+pub mod cache;
+pub mod nix;
 
-const NIX_EXPR: &str = r#"
-with builtins.getFlake "nixpkgs";
-with legacyPackages.${builtins.currentSystem};
-lib.filter lib.isDerivation stdenv.allowedRequisites
-"#;
+use std::{collections::HashSet, env, process::ExitCode};
 
 const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin"];
-
-// Run a command with a timeout. Returns None if timeout occurs.
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let result = cmd.output();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => Some(output),
-        _ => None, // Timeout or command failed
-    }
-}
 
 fn main() -> ExitCode {
     // cache TTL (secs). TTL=0 => no cache (no read, no write).
@@ -37,21 +12,25 @@ fn main() -> ExitCode {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3600);
 
-    // Get cache metadata once (avoid redundant nix calls)
-    let cache_key = if ttl > 0 {
-        get_cache_key()
-    } else {
-        None
-    };
+    // Get both project and system revisions
+    let (project_rev, system_rev) = nix::get_nixpkgs_revs();
 
-    // nix eval output (cached unless TTL=0)
+    // Generate cache keys for both (if they exist)
+    let project_key = project_rev.as_ref().map(|rev| nix::make_cache_key(rev));
+    let system_key = system_rev.as_ref().map(|rev| nix::make_cache_key(rev));
+
+    // Get stdenv data (handles all 6 cases properly)
     let bytes = if ttl == 0 {
-        refresh(false, None)
+        // No caching
+        nix::query_stdenv_multi(&project_rev, &system_rev)
     } else {
-        read_cache(ttl, cache_key.as_deref())
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| refresh(true, cache_key.as_deref()))
+        cache::get_or_refresh_stdenv(
+            ttl,
+            &project_rev,
+            &system_rev,
+            project_key.as_deref(),
+            system_key.as_deref(),
+        )
     };
     let ignore = parse_hashes(&bytes);
 
@@ -77,50 +56,6 @@ fn main() -> ExitCode {
     } else {
         ExitCode::from(1)
     }
-}
-
-fn get_cache_key() -> Option<String> {
-    // Get revision-system key in one nix call (no JSON parsing needed)
-    let mut cmd = Command::new("nix");
-    cmd.args([
-        "eval",
-        "--impure",
-        "--raw",
-        "--expr",
-        r#""${(builtins.getFlake "nixpkgs").rev}-${builtins.currentSystem}""#,
-    ]);
-
-    let output = run_with_timeout(cmd, Duration::from_secs(2))?;
-
-    if output.status.success() {
-        String::from_utf8(output.stdout).ok()
-    } else {
-        None
-    }
-}
-
-fn refresh(write_cache_after: bool, cache_key: Option<&str>) -> Vec<u8> {
-    let mut cmd = Command::new("nix");
-    cmd.args(["eval", "--impure", "--json", "--expr", NIX_EXPR]);
-
-    // Use timeout to prevent hanging
-    let o = match run_with_timeout(cmd, Duration::from_secs(2)) {
-        Some(output) => output,
-        None => {
-            // Timeout occurred, return empty result (will result in exit code 1)
-            return Vec::new();
-        }
-    };
-
-    if !o.status.success() {
-        // Command failed, return empty result instead of panicking
-        return Vec::new();
-    }
-
-    if write_cache_after {
-        let _ = write_cache(&o.stdout, cache_key); // best-effort
-    }
-    o.stdout
 }
 
 fn parse_hashes(json: &[u8]) -> HashSet<String> {
@@ -177,87 +112,4 @@ fn hash_and_name(dir: &str) -> Option<(&str, &str)> {
         }
     }
     Some((hash, &item[..cut]))
-}
-
-// XDG cache helpers
-fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            return Path::new(&xdg).join("nix-path-pkgs");
-        }
-    }
-    Path::new(&env::var("HOME").unwrap_or_else(|_| ".".into())).join(".cache/nix-path-pkgs")
-}
-
-fn cache_file(cache_key: &str) -> PathBuf {
-    cache_dir().join(format!("{}-stdenv-allowed-requisites.json", cache_key))
-}
-
-// Clean up old cache files (older than 1 day)
-fn cleanup_old_cache() -> io::Result<()> {
-    let dir = cache_dir();
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    let now = SystemTime::now();
-    let one_day = Duration::from_secs(86400);
-
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
-        if let Ok(metadata) = fs::metadata(&path) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(age) = now.duration_since(modified) {
-                    if age > one_day {
-                        let _ = fs::remove_file(&path); // best-effort
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-fn read_cache(ttl_secs: u64, cache_key: Option<&str>) -> io::Result<Option<Vec<u8>>> {
-    let Some(key) = cache_key else {
-        return Ok(None);
-    };
-    let p = cache_file(key);
-
-    let meta = match fs::metadata(&p) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-
-    if meta
-        .modified()
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|d| d <= Duration::from_secs(ttl_secs))
-    {
-        return Ok(Some(fs::read(&p)?));
-    }
-
-    Ok(None)
-}
-
-fn write_cache(bytes: &[u8], cache_key: Option<&str>) -> io::Result<()> {
-    let Some(key) = cache_key else {
-        return Ok(());
-    };
-    let p = cache_file(key);
-
-    fs::create_dir_all(cache_dir())?;
-    fs::write(&p, bytes)?;
-
-    // Clean up old cache files
-    let _ = cleanup_old_cache(); // best-effort
-
-    Ok(())
 }
