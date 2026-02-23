@@ -3,7 +3,7 @@ pub mod nix;
 
 use std::{collections::HashSet, env, process::ExitCode};
 
-const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin"];
+const SKIP: &[&str] = &["bash-interactive", "ghostty", "ghostty-bin", "ghostty-bin-nightly"];
 
 fn main() -> ExitCode {
     // cache TTL (secs). TTL=0 => no cache (no read, no write).
